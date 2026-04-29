@@ -6,6 +6,7 @@ const path = require("path");
 const fs = require("fs");
 const { BlobServiceClient } = require("@azure/storage-blob");
 const { CosmosClient } = require("@azure/cosmos");
+const jwt = require("jsonwebtoken");
 
 // Initialize Application Insights if key is provided
 if (process.env.APPINSIGHTS_INSTRUMENTATIONKEY && process.env.APPINSIGHTS_INSTRUMENTATIONKEY !== 'your_appinsights_key') {
@@ -36,7 +37,7 @@ if (cosmosConnectionString && !cosmosConnectionString.includes('your_key')) {
     const client = new CosmosClient(cosmosConnectionString);
     const database = client.database("TarekPixDB");
     cosmosContainer = database.container("Images");
-    
+
     // Create DB and container if they don't exist
     client.databases.createIfNotExists({ id: "TarekPixDB" })
         .then(() => database.containers.createIfNotExists({ id: "Images", partitionKey: "/id" }))
@@ -46,13 +47,40 @@ if (cosmosConnectionString && !cosmosConnectionString.includes('your_key')) {
 // Fallback logic for local testing without Azure config
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
+    fs.mkdirSync(uploadDir);
 }
 app.use("/uploads", express.static(uploadDir));
 let localImages = [];
 
 // Multer memory storage for Azure upload
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Middleware to verify JWT token
+const verifyToken = (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Access denied. No token provided." });
+    }
+    const token = authHeader.split(" ")[1];
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (error) {
+        res.status(400).json({ error: "Invalid token." });
+    }
+};
+
+// Login route
+app.post("/api/login", (req, res) => {
+    const { email, password } = req.body;
+    if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
+        const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        res.json({ token, email });
+    } else {
+        res.status(401).json({ error: "Invalid credentials." });
+    }
+});
 
 // Get all images
 app.get("/api/images", async (req, res) => {
@@ -70,10 +98,10 @@ app.get("/api/images", async (req, res) => {
 });
 
 // Upload image
-app.post("/api/images", upload.single("image"), async (req, res) => {
+app.post("/api/images", verifyToken, upload.single("image"), async (req, res) => {
     try {
         let imageUrl = null;
-        
+
         if (req.file) {
             if (containerClient) {
                 // Upload to Azure Blob
@@ -95,7 +123,9 @@ app.post("/api/images", upload.single("image"), async (req, res) => {
             id: Date.now().toString(),
             title: req.body.title,
             category: req.body.category,
-            imageUrl: imageUrl || req.body.imageUrl // Fallback if passed directly
+            imageUrl: imageUrl || req.body.imageUrl, // Fallback if passed directly
+            uploadedBy: req.body.uploadedBy || 'Anonymous',
+            uploadedTime: new Date().toISOString()
         };
 
         if (cosmosContainer) {
@@ -112,7 +142,7 @@ app.post("/api/images", upload.single("image"), async (req, res) => {
 });
 
 // Update image details (PUT)
-app.put("/api/images/:id", async (req, res) => {
+app.put("/api/images/:id", verifyToken, async (req, res) => {
     try {
         const { title, category } = req.body;
         const { id } = req.params;
@@ -124,7 +154,7 @@ app.put("/api/images/:id", async (req, res) => {
             }
             existingImage.title = title;
             existingImage.category = category;
-            
+
             const { resource: updatedImage } = await cosmosContainer.item(id, id).replace(existingImage);
             res.json(updatedImage);
         } else {
@@ -143,23 +173,23 @@ app.put("/api/images/:id", async (req, res) => {
 });
 
 // Delete image
-app.delete("/api/images/:id", async (req, res) => {
+app.delete("/api/images/:id", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
 
         if (cosmosContainer) {
             const { resource: imageToDelete } = await cosmosContainer.item(id, id).read();
-            
+
             if (imageToDelete && imageToDelete.imageUrl && containerClient) {
                 try {
                     const urlParts = new URL(imageToDelete.imageUrl);
                     const blobName = urlParts.pathname.split('/').pop();
                     await containerClient.getBlockBlobClient(blobName).deleteIfExists();
-                } catch(e) {
+                } catch (e) {
                     console.error("Failed to delete blob:", e);
                 }
             }
-            
+
             await cosmosContainer.item(id, id).delete();
             res.json({ message: "Deleted successfully" });
         } else {
@@ -174,7 +204,7 @@ app.delete("/api/images/:id", async (req, res) => {
                             fs.unlinkSync(filePath);
                         }
                     }
-                } catch(e) {
+                } catch (e) {
                     console.error(e);
                 }
             }
